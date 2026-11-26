@@ -1,0 +1,65 @@
+name: Telegram smoke test
+on:
+  push:
+    paths:
+      - '.github/workflows/telegram-smoke.yml'
+  workflow_dispatch:
+permissions: {}
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Verify bot and optionally send private test
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          EVENT: ${{ github.event_name }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import urllib.error
+          import urllib.request
+
+          token = os.getenv("TOKEN", "").strip()
+          if not token:
+              raise SystemExit("Missing repository secret TELEGRAM_BOT_TOKEN.")
+          if not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]+", token):
+              raise SystemExit("Invalid Telegram bot token format.")
+
+          def telegram(method, payload):
+              request = urllib.request.Request(
+                  f"https://api.telegram.org/bot{token}/{method}",
+                  data=json.dumps(payload).encode(),
+                  headers={"Content-Type": "application/json"},
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=15) as response:
+                      body = json.load(response)
+              except urllib.error.HTTPError as error:
+                  raise SystemExit(f"Telegram {method}: HTTP {error.code}.")
+              except (OSError, ValueError):
+                  raise SystemExit(f"Telegram {method}: request or response failed.")
+              if not body.get("ok"):
+                  raise SystemExit(f"Telegram {method}: API rejected the request.")
+              return body["result"]
+
+          telegram("getMe", {})
+          summary = os.environ["GITHUB_STEP_SUMMARY"]
+          with open(summary, "a", encoding="utf-8") as output:
+              print("Telegram bot authentication verified.", file=output)
+              if os.environ["EVENT"] != "workflow_dispatch":
+                  print("Push check did not send a message.", file=output)
+              else:
+                  chat = os.getenv("CHAT_ID", "").strip()
+                  if not re.fullmatch(r"[1-9][0-9]*", chat):
+                      raise SystemExit("Set TELEGRAM_CHAT_ID to the intended private chat ID.")
+                  telegram("sendMessage", {
+                      "chat_id": int(chat),
+                      "text": "Flight Finder: Kết nối Telegram thành công. Đây là tin nhắn thử.",
+                  })
+                  print("Telegram accepted the private test message.", file=output)
+          PY
