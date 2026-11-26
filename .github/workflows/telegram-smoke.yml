@@ -10,10 +10,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
-      - name: Verify bot and optionally send private test
+      - name: Verify bot and optionally send topic test
         env:
           TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          THREAD_ID: ${{ secrets.TELEGRAM_THREAD_ID }}
           EVENT: ${{ github.event_name }}
         shell: bash
         run: |
@@ -47,7 +48,9 @@ jobs:
                   raise SystemExit(f"Telegram {method}: API rejected the request.")
               return body["result"]
 
-          telegram("getMe", {})
+          account = telegram("getMe", {})
+          if account.get("username", "").casefold() != "mm_suggest_travel_bot":
+              raise SystemExit("The token is not for the expected Flight Finder bot.")
           summary = os.environ["GITHUB_STEP_SUMMARY"]
           with open(summary, "a", encoding="utf-8") as output:
               print("Telegram bot authentication verified.", file=output)
@@ -55,11 +58,15 @@ jobs:
                   print("Push check did not send a message.", file=output)
               else:
                   chat = os.getenv("CHAT_ID", "").strip()
-                  if not re.fullmatch(r"[1-9][0-9]*", chat):
-                      raise SystemExit("Set TELEGRAM_CHAT_ID to the intended private chat ID.")
-                  telegram("sendMessage", {
+                  thread = os.getenv("THREAD_ID", "").strip()
+                  if not re.fullmatch(r"-100[0-9]+", chat) or not re.fullmatch(r"[1-9][0-9]*", thread):
+                      raise SystemExit("Set the Telegram supergroup and topic secrets.")
+                  sent = telegram("sendMessage", {
                       "chat_id": int(chat),
+                      "message_thread_id": int(thread),
                       "text": "Flight Finder: Kết nối Telegram thành công. Đây là tin nhắn thử.",
                   })
-                  print("Telegram accepted the private test message.", file=output)
+                  if sent.get("chat", {}).get("id") != int(chat) or sent.get("message_thread_id") != int(thread):
+                      raise SystemExit("Telegram returned an unexpected destination.")
+                  print("Telegram confirmed delivery to the configured topic.", file=output)
           PY
