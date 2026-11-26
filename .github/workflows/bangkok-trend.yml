@@ -1,0 +1,84 @@
+name: Bangkok fare trend
+on:
+  push:
+    paths:
+      - '.github/workflows/bangkok-trend.yml'
+  workflow_dispatch:
+permissions: {}
+jobs:
+  trend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Check recent price history for Bangkok
+        env:
+          SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import datetime as dt
+          import json
+          import os
+          import statistics
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from zoneinfo import ZoneInfo
+
+          key = os.getenv("SERPAPI_API_KEY", "").strip()
+          if not key:
+              raise SystemExit("Missing SERPAPI_API_KEY.")
+          tz = ZoneInfo("Asia/Bangkok")
+          today = dt.datetime.now(tz).date()
+          start = today - dt.timedelta(days=29)
+          report = [f"**Price observations:** {start} to {today} (Bangkok time). One-way, 1 adult, economy, VND.",
+                    "", "| Origin | Departure | Observations | First | Last | Min | Max | Median | Live lowest |",
+                    "|---|---|---:|---:|---:|---:|---:|---:|---:|"]
+          details = []
+          failures = 0
+          for origin in ("SGN", "CXR"):
+              for departure in ("2027-02-08", "2027-02-09"):
+                  query = urllib.parse.urlencode({
+                      "engine": "google_flights", "departure_id": origin, "arrival_id": "BKK",
+                      "outbound_date": departure, "type": 2, "currency": "VND",
+                      "hl": "en", "gl": "vn", "adults": 1, "api_key": key,
+                  })
+                  try:
+                      with urllib.request.urlopen("https://serpapi.com/search.json?" + query, timeout=40) as response:
+                          data = json.load(response)
+                  except urllib.error.HTTPError as error:
+                      details.append(f"- {origin} {departure}: provider HTTP {error.code}.")
+                      failures += 1
+                      continue
+                  except (OSError, ValueError):
+                      details.append(f"- {origin} {departure}: provider request failed.")
+                      failures += 1
+                      continue
+                  if data.get("error"):
+                      details.append(f"- {origin} {departure}: provider returned an error.")
+                      failures += 1
+                      continue
+                  insight = data.get("price_insights") or {}
+                  prices = {}
+                  for stamp, price in sorted(insight.get("price_history") or ()):
+                      day = dt.datetime.fromtimestamp(stamp, tz).date()
+                      if start <= day <= today and isinstance(price, (int, float)) and price > 0:
+                          prices[day] = price
+                  fares = [offer.get("price") for group in ("best_flights", "other_flights")
+                           for offer in (data.get(group) or [])]
+                  live = min((p for p in fares if isinstance(p, (int, float)) and p > 0), default=None)
+                  pct = list(prices.values())
+                  fmt = lambda n: f"{n:,.0f}" if n is not None else "—"
+                  stats = [pct[0], pct[-1], min(pct), max(pct), statistics.median(pct)] if pct else [None] * 5
+                  report.append("| " + " | ".join([origin, departure, str(len(pct)), *(fmt(p) for p in stats), fmt(live)]) + " |")
+                  if prices:
+                      details.append(f"- {origin} {departure} ({min(prices)} to {max(prices)}): " +
+                                     ", ".join(f"{d:%m-%d} {fmt(p)}" for d, p in prices.items()))
+                  else:
+                      details.append(f"- {origin} {departure}: no history in the requested period.")
+          report += ["", *details]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as out:
+              out.write("\n".join(report) + "\n")
+          if failures == 4:
+              raise SystemExit("All four requests failed.")
+          PY
