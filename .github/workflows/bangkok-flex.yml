@@ -1,0 +1,80 @@
+name: Bangkok flexible dates
+on:
+  push:
+    paths: ['.github/workflows/bangkok-flex.yml']
+  workflow_dispatch:
+permissions: {}
+jobs:
+  fares:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Compare exact flight quotes around February 8
+        env:
+          KEY: ${{ secrets.SERPAPI_API_KEY }}
+        run: |
+          python3 - <<'PY'
+          import concurrent.futures
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          key = os.environ["KEY"].strip()
+          if not key:
+              raise SystemExit("Missing SerpApi key.")
+          origins = ("SGN", "CXR")
+          airports = ("BKK", "DMK")
+          days = [f"2027-02-{day:02d}" for day in range(5, 12)]
+
+          def quote(task):
+              origin, date = task
+              params = dict(engine="google_flights", departure_id=origin, arrival_id="BKK,DMK",
+                            outbound_date=date, type=2, currency="VND", hl="en", gl="vn", adults=1, api_key=key)
+              try:
+                  url = "https://serpapi.com/search.json?" + urllib.parse.urlencode(params)
+                  with urllib.request.urlopen(url, timeout=30) as response:
+                      data = json.load(response)
+              except urllib.error.HTTPError as error:
+                  return {}, f"HTTP {error.code}"
+              except (ValueError, OSError):
+                  return {}, "request failed"
+              if data.get("error"):
+                  return {}, "provider returned no usable result"
+              by_airport = {}
+              for group in ("best_flights", "other_flights"):
+                  for offer in data.get(group) or []:
+                      legs = offer.get("flights") or []
+                      price = offer.get("price")
+                      if not legs or type(price) is not int or price <= 0:
+                          continue
+                      arrival = legs[-1].get("arrival_airport") or {}
+                      airport = arrival.get("id")
+                      when = arrival.get("time") or ""
+                      if airport not in airports:
+                          continue
+                      entry = (price, len(legs) - 1, when, legs[0].get("airline") or "")
+                      if airport not in by_airport or entry < by_airport[airport]:
+                          by_airport[airport] = entry
+              return by_airport, None
+
+          tasks = [(origin, date) for date in days for origin in origins]
+          with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+              results = dict(zip(tasks, pool.map(quote, tasks)))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as out:
+              print("Exact fare offers, VND / adult / one way. Any stops. Baggage fees unverified.", file=out)
+              print("", file=out)
+              for date in days:
+                  for airport in airports:
+                      offers = [results[origin, date][0].get(airport) for origin in origins]
+                      parts = [f"{origin} {offer[0]:,} VND ({offer[1]} stops; {offer[2]}; {offer[3]})"
+                               if offer else f"{origin} —" for origin, offer in zip(origins, offers)]
+                      total = f"{sum(offer[0] for offer in offers):,} VND" if all(offers) else "—"
+                      print(f"- {date[8:]} Feb {airport} | " + " | ".join(parts) + f" | Total {total}", file=out)
+              for (origin, date), (_, error) in results.items():
+                  if error:
+                      print(f"- {origin} {date}: {error}", file=out)
+          if not any(fares for fares, _ in results.values()):
+              raise SystemExit("No priced offers returned.")
+          PY
