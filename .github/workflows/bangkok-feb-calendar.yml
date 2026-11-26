@@ -1,0 +1,127 @@
+name: Bangkok February calendar
+on:
+  push:
+    paths: ['.github/workflows/bangkok-feb-calendar.yml']
+  workflow_dispatch:
+permissions: {}
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Read February calendars and deliver report
+        env:
+          KEY: ${{ secrets.SERPAPI_API_KEY }}
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          THREAD: ${{ secrets.TELEGRAM_THREAD_ID }}
+          SEND: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          python3 - <<'PY'
+          import datetime as dt
+          import json
+          import os
+          import re
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from zoneinfo import ZoneInfo
+
+          def fetch(url, payload=None):
+              request = urllib.request.Request(url, data=payload)
+              if payload is not None:
+                  request.add_header("Content-Type", "application/json")
+              try:
+                  with urllib.request.urlopen(request, timeout=25) as response:
+                      return json.load(response), None
+              except urllib.error.HTTPError as error:
+                  return {}, f"HTTP {error.code}"
+              except (OSError, ValueError):
+                  return {}, "request failed"
+
+          key = os.environ["KEY"].strip()
+          if not key:
+              raise SystemExit("Missing SerpApi secret.")
+          routes = {}
+          notes = []
+          days = [dt.date(2027, 2, n).isoformat() for n in range(1, 29)]
+          for origin in ("SGN", "CXR"):
+              for airport in ("BKK", "DMK"):
+                  query = urllib.parse.urlencode(dict(
+                      engine="google_flights_calendar", departure_id=origin, arrival_id=airport,
+                      date_range_start=days[0], date_range_end=days[-1], type=2,
+                      currency="VND", hl="en", gl="vn", adults=1, api_key=key))
+                  data, error = fetch("https://serpapi.com/search.json?" + query)
+                  fares = {}
+                  if not error and not data.get("error"):
+                      for row in data.get("prices") or []:
+                          date, price = row.get("outbound_date"), row.get("price")
+                          if date in days and type(price) is int and price > 0:
+                              fares[date] = min(price, fares.get(date, price))
+                  else:
+                      notes.append(f"{origin}→{airport}: {error or 'lỗi nguồn'}")
+                  routes[origin, airport] = fares
+
+          def money(n):
+              return f"{n:,}".replace(",", ".") + "đ" if n is not None else "—"
+
+          def show(date):
+              return date[8:10] + "/02"
+
+          def pair(date, airport):
+              one = routes["SGN", airport].get(date)
+              two = routes["CXR", airport].get(date)
+              return one + two if one is not None and two is not None else None
+
+          def best_pair(selected_days):
+              values = [(pair(d, a), d, a) for d in selected_days for a in ("BKK", "DMK")]
+              return min((v for v in values if v[0] is not None), default=None)
+
+          today = dt.datetime.now(ZoneInfo("Asia/Bangkok"))
+          link = f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          lines = ["✈️ LỊCH GIÁ BANGKOK · 02/2027",
+                   f"Tra lúc {today:%H:%M %d/%m/%Y} giờ VN · 1 chiều, 1 người/tuyến",
+                   "Giá Calendar theo ngày bay. Chưa xác minh giờ đến hoặc phí hành lý.", "",
+                   "Mốc chính và ngày lân cận"]
+          for date in days[5:11]:
+              lines.append(f"{show(date)} · Cùng BKK {money(pair(date, 'BKK'))} · Cùng DMK {money(pair(date, 'DMK'))}")
+          preferred = best_pair(days[7:9])
+          nearby = best_pair(days[5:11])
+          month = best_pair(days)
+          for label, result in (("Rẻ nhất 08–09/02", preferred), ("Rẻ nhất 06–11/02", nearby), ("Rẻ nhất tháng", month)):
+              if result:
+                  total, date, airport = result
+                  lines.append(f"{label}: {show(date)} → {airport} · {money(total)} cho 2 vé")
+          if preferred and nearby and nearby[0] < preferred[0]:
+              lines.append(f"Đổi sang {show(nearby[1])} tiết kiệm {money(preferred[0] - nearby[0])} so với lựa chọn tốt nhất 08–09/02.")
+          lines.append("")
+          for (origin, airport), fares in routes.items():
+              examples = ", ".join(f"{show(d)} {money(p)}" for d, p in sorted(fares.items(), key=lambda item: (item[1], item[0]))[:2])
+              lines.append(f"{origin}→{airport} ({len(fares)}/28 ngày): {examples or 'chưa có giá'}")
+          lines += notes
+          lines += ["— = nguồn chưa có đủ giá cho hai vé.", link]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as out:
+              out.write("\n".join(lines) + "\n\n")
+              out.write("| Ngày | SGN→BKK | SGN→DMK | CXR→BKK | CXR→DMK | Tổng BKK | Tổng DMK |\n|---|---:|---:|---:|---:|---:|---:|\n")
+              for date in days:
+                  cells = [show(date), *(money(fares.get(date)) for fares in routes.values()),
+                           money(pair(date, "BKK")), money(pair(date, "DMK"))]
+                  out.write("| " + " | ".join(cells) + " |\n")
+
+              if not any(routes.values()):
+                  raise SystemExit("No calendar fares returned.")
+              if os.environ.get("SEND") == "true":
+                  token, chat, thread = (os.environ[n].strip() for n in ("TOKEN", "CHAT", "THREAD"))
+                  if not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]+", token) or not re.fullmatch(r"-100[0-9]+", chat) or not re.fullmatch(r"[1-9][0-9]*", thread):
+                      raise SystemExit("Missing Telegram bot or forum topic settings.")
+                  base = f"https://api.telegram.org/bot{token}/"
+                  identity, error = fetch(base + "getMe")
+                  if error or identity.get("result", {}).get("username", "").casefold() != "mm_suggest_travel_bot":
+                      raise SystemExit("Telegram bot identity not verified.")
+                  payload = json.dumps(dict(chat_id=int(chat), message_thread_id=int(thread), text="\n".join(lines))).encode()
+                  sent, error = fetch(base + "sendMessage", payload)
+                  message = sent.get("result") or {}
+                  if error or not sent.get("ok") or message.get("chat", {}).get("id") != int(chat) or message.get("message_thread_id") != int(thread):
+                      raise SystemExit("Telegram delivery not confirmed: " + (error or "unexpected response"))
+                  out.write("\nTelegram confirmed topic delivery.\n")
+          PY
