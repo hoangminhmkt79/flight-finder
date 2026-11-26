@@ -1,0 +1,96 @@
+name: Flight Finder
+on:
+  push:
+    paths:
+      - '.github/workflows/flight-finder.yml'
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Departure date (YYYY-MM-DD)'
+        default: '2027-02-10'
+        type: string
+      live:
+        description: 'Fetch live fares using SerpApi (three searches)'
+        default: false
+        type: boolean
+permissions: {}
+jobs:
+  fares:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check routes or fetch fares
+        env:
+          LIVE: ${{ github.event_name == 'workflow_dispatch' && inputs.live }}
+          OUTBOUND_DATE: ${{ inputs.date || '2027-02-10' }}
+          SERPAPI_API_KEY: ${{ github.event_name == 'workflow_dispatch' && inputs.live && secrets.SERPAPI_API_KEY || '' }}
+        shell: bash
+        run: |
+          cat > flight_finder.py <<'PYTHON'
+          """Fetch one-way fares from SerpApi and report the lowest returned prices."""
+          import argparse
+          import datetime
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          
+          
+          def lowest_price(origin, destination, date, key):
+              query = urllib.parse.urlencode({
+                  "engine": "google_flights", "departure_id": origin,
+                  "arrival_id": destination, "outbound_date": date,
+                  "type": 2, "currency": "VND", "hl": "en", "gl": "vn",
+                  "adults": 1, "api_key": key,
+              })
+              with urllib.request.urlopen("https://serpapi.com/search.json?" + query, timeout=30) as response:
+                  data = json.load(response)
+              if data.get("error"):
+                  raise ValueError("SerpApi returned an error. Check the SerpApi dashboard.")
+              prices = [
+                  item["price"]
+                  for group in ("best_flights", "other_flights")
+                  for item in (data.get(group) or [])
+                  if isinstance(item.get("price"), (int, float))
+              ]
+              return min(prices, default=None)
+          
+          
+          def main():
+              parser = argparse.ArgumentParser(description=__doc__)
+              parser.add_argument("--date", default="2027-02-10", type=datetime.date.fromisoformat)
+              parser.add_argument("--dry-run", action="store_true")
+              options = parser.parse_args()
+              routes = (("SGN", "BKK,DMK"), ("SGN", "HKT"), ("SGN", "CNX"))
+              key = os.getenv("SERPAPI_API_KEY", "").strip()
+              if not options.dry_run and not key:
+                  parser.error("Set SERPAPI_API_KEY before running a live lookup.")
+              failed = False
+              for origin, destination in routes:
+                  label = f"{origin} → {destination} | {options.date}"
+                  if options.dry_run:
+                      print(label)
+                      continue
+                  try:
+                      price = lowest_price(origin, destination, options.date.isoformat(), key)
+                  except urllib.error.HTTPError as error:
+                      print(f"{label} | SerpApi HTTP {error.code}", file=sys.stderr)
+                      failed = True
+                  except (OSError, ValueError):
+                      print(f"{label} | Could not read a SerpApi result. Check network and API status.", file=sys.stderr)
+                      failed = True
+                  else:
+                      print(f"{label} | {price:,.0f} VND" if price is not None else f"{label} | No priced offers returned")
+              return int(failed)
+          
+          
+          if __name__ == "__main__":
+              raise SystemExit(main())
+          PYTHON
+          if [[ "$LIVE" == "true" ]]; then
+            python3 flight_finder.py --date "$OUTBOUND_DATE" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            python3 flight_finder.py --dry-run --date "$OUTBOUND_DATE" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
