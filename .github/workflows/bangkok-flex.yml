@@ -21,7 +21,7 @@ jobs:
           SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TELEGRAM_THREAD_ID: ${{ secrets.TELEGRAM_THREAD_ID }}
+          TELEGRAM_THREAD_ID: ${{ vars.TELEGRAM_THREAD_ID }}
           CENTER_DATE: ${{ inputs.center_date }}
         run: |
           python3 - <<'PY'
@@ -32,9 +32,12 @@ jobs:
           import urllib.parse
           import urllib.request
 
-          secret_names = ("SERPAPI_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "TELEGRAM_THREAD_ID")
+          secret_names = ("SERPAPI_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")
           secrets = {name: os.environ.get(name, "").strip() for name in secret_names}
           missing = [name for name, value in secrets.items() if not value]
+          thread_id = os.environ.get("TELEGRAM_THREAD_ID", "").strip()
+          if not thread_id:
+              missing.append("TELEGRAM_THREAD_ID")
           if missing:
               raise SystemExit("Missing GitHub secrets: " + ", ".join(missing))
 
@@ -143,7 +146,7 @@ jobs:
 
           sent = telegram("sendMessage", {
               "chat_id": secrets["TELEGRAM_CHAT_ID"],
-              "message_thread_id": secrets["TELEGRAM_THREAD_ID"],
+              "message_thread_id": thread_id,
               "text": message,
               "disable_web_page_preview": "true",
           })
@@ -153,7 +156,7 @@ jobs:
           delivered = sent.get("result", {})
           if (
               str(delivered.get("chat", {}).get("id")) != secrets["TELEGRAM_CHAT_ID"]
-              or str(delivered.get("message_thread_id", "")) != secrets["TELEGRAM_THREAD_ID"]
+              or str(delivered.get("message_thread_id", "")) != thread_id
           ):
               raise SystemExit("Telegram trả về sai nhóm hoặc topic.")
 
