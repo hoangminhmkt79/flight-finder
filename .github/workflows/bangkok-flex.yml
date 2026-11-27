@@ -151,25 +151,25 @@ jobs:
                   delta = price - median
                   pct = round(delta / median * 100) if median else 0
                   threshold = max(250_000, int(median * 0.10))
-                  if (low is not None and price <= low) or delta <= -threshold:
-                      return f"🟢 RẺ RÕ · thấp hơn median 30 ngày {money(abs(delta))} ({abs(pct)}%) · n={count}"
-                  if high is not None and price > high:
-                      above = price - high
-                      if above >= threshold:
-                          return f"🔴 CAO HƠN MỐC {money(above)} · +{pct}% so với median · cân nhắc đổi ngày"
-                      return f"🟠 NHỈNH CAO {money(above)} so với khung thường"
-                  return f"🟡 TRONG MẶT BẰNG · median 30 ngày {money(median)} · n={count}"
+                  if delta <= -threshold:
+                      verdict = f"🟢 THẤP HƠN MỐC 30 NGÀY {money(abs(delta))} ({abs(pct)}%)"
+                  elif delta >= threshold:
+                      verdict = f"🔴 CAO HƠN MỐC 30 NGÀY {money(delta)} ({pct:+d}%) · cân nhắc đổi ngày"
+                  else:
+                      verdict = f"🟡 QUANH MẶT BẰNG 30 NGÀY ({pct:+d}% so với median)"
+                  if low is not None and high is not None:
+                      verdict += f" · khung Google {money(low)}–{money(high)}"
+                  return verdict + f" · n={count}"
               if low is not None and high is not None:
                   if price <= low:
-                      return f"🟢 THẤP HƠN KHUNG THƯỜNG · {money(low)}–{money(high)}"
+                      return f"🟢 THẤP HƠN KHUNG GOOGLE · {money(low)}–{money(high)}"
                   if price > high:
-                      return f"🔴 CAO HƠN KHUNG THƯỜNG {money(price - high)} · {money(low)}–{money(high)}"
-                  return f"🟡 TRONG KHUNG THƯỜNG · {money(low)}–{money(high)} · lịch sử chưa đủ"
+                      return f"🔴 CAO HƠN KHUNG GOOGLE {money(price - high)} · khung {money(low)}–{money(high)}"
+                  return f"🟡 TRONG KHUNG GOOGLE · {money(low)}–{money(high)} · lịch sử chưa đủ"
               if offer["market_level"] in ("low", "typical", "high"):
                   level = {"low": "thấp", "typical": "bình thường", "high": "cao"}[offer["market_level"]]
                   return f"⚪ Google đánh giá mức {level}; chưa đủ mốc để kết luận."
               return "⚪ Chưa đủ dữ liệu thị trường để kết luận rẻ hay cao."
-
           lines = [
               f"✈️ VÉ BANGKOK · {dates[0].strftime('%d/%m')}–{dates[-1].strftime('%d/%m/%Y')}",
               f"Tra lúc {checked_at} · một chiều · 1 người lớn · giá/người",
