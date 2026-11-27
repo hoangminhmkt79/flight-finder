@@ -15,14 +15,13 @@ A run uses up to six SerpApi searches (three dates × two origins). Commits do n
 
 ## Required GitHub Actions secrets
 
-In **Settings → Secrets and variables → Actions**, add:
+In **Settings → Secrets and variables → Actions → Secrets**, add:
 
 - `SERPAPI_API_KEY`
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
-- `TELEGRAM_THREAD_ID`
 
-Use the chat and topic that contain `@MM_suggest_travel_bot`. The workflow checks the bot username and confirms Telegram accepted the message in the expected chat and topic. Never commit secret values to this repository.
+In the **Variables** tab, add the non-sensitive `TELEGRAM_THREAD_ID` value `3`. The topic ID is a variable so GitHub does not mask matching digits in the fare report. Use the chat and topic that contain `@MM_suggest_travel_bot`. The workflow checks the bot username and confirms Telegram accepted the message in the expected chat and topic. Never commit secret values to this repository.
 
 ## Workflow source
 
