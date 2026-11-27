@@ -29,6 +29,7 @@ jobs:
           import datetime
           import json
           import os
+          import statistics
           import urllib.parse
           import urllib.request
 
@@ -73,6 +74,23 @@ jobs:
               if data.get("error"):
                   return task, None, "Nhà cung cấp trả lỗi."
 
+              insight = data.get("price_insights") or {}
+              typical = insight.get("typical_price_range") or []
+              market_low = int(typical[0]) if len(typical) == 2 and isinstance(typical[0], (int, float)) and typical[0] > 0 else None
+              market_high = int(typical[1]) if len(typical) == 2 and isinstance(typical[1], (int, float)) and typical[1] > 0 else None
+              now_utc = datetime.datetime.now(datetime.timezone.utc)
+              cutoff = now_utc - datetime.timedelta(days=29)
+              history_prices = []
+              for point in insight.get("price_history") or []:
+                  try:
+                      stamp, historical_price = point[0], point[1]
+                      observed = datetime.datetime.fromtimestamp(int(stamp), datetime.timezone.utc)
+                      if cutoff <= observed <= now_utc and isinstance(historical_price, (int, float)) and historical_price > 0:
+                          history_prices.append(int(historical_price))
+                  except (TypeError, ValueError, IndexError, OverflowError):
+                      continue
+              history_median = int(statistics.median(history_prices)) if len(history_prices) >= 5 else None
+              market_level = insight.get("price_level") or ""
               offers = []
               for group in ("best_flights", "other_flights"):
                   for result in data.get(group) or []:
@@ -94,8 +112,15 @@ jobs:
                           "depart": departure.get("time") or "Chưa rõ giờ",
                           "arrive": arrival.get("time") or "Chưa rõ giờ",
                           "stops": len(legs) - 1,
+                          "market_low": market_low,
+                          "market_high": market_high,
+                          "history_median": history_median,
+                          "history_count": len(history_prices),
+                          "market_level": market_level,
                       })
-              return task, (min(offers, key=lambda item: (item["price"], item["stops"])) if offers else None), None
+              if not offers:
+                  return task, None, "Không có chuyến có giá."
+              return task, min(offers, key=lambda item: (item["price"], item["stops"])), None
 
           tasks = [(origin, day) for day in dates for origin in origins]
           with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
@@ -107,26 +132,64 @@ jobs:
 
           checked_at = datetime.datetime.now(
               datetime.timezone(datetime.timedelta(hours=7))
-          ).strftime("%H:%M %d/%m/%Y (giờ Việt Nam)")
+          ).strftime("%H:%M %d/%m/%Y (giờ VN)")
+
+          def money(value):
+              return f"{value:,.0f}".replace(",", ".") + " ₫" if value is not None else "chưa có mốc"
+
+          def hhmm(value):
+              try:
+                  return datetime.datetime.fromisoformat(value).strftime("%H:%M")
+              except (TypeError, ValueError):
+                  return value[-5:] if isinstance(value, str) and len(value) >= 5 else "chưa rõ giờ"
+
+          def market_verdict(offer):
+              price = offer["price"]
+              low, high = offer["market_low"], offer["market_high"]
+              median, count = offer["history_median"], offer["history_count"]
+              if median is not None:
+                  delta = price - median
+                  pct = round(delta / median * 100) if median else 0
+                  threshold = max(250_000, int(median * 0.10))
+                  if (low is not None and price <= low) or delta <= -threshold:
+                      return f"🟢 RẺ RÕ · thấp hơn median 30 ngày {money(abs(delta))} ({abs(pct)}%) · n={count}"
+                  if high is not None and price > high:
+                      above = price - high
+                      if above >= threshold:
+                          return f"🔴 CAO HƠN MỐC {money(above)} · +{pct}% so với median · cân nhắc đổi ngày"
+                      return f"🟠 NHỈNH CAO {money(above)} so với khung thường"
+                  return f"🟡 TRONG MẶT BẰNG · median 30 ngày {money(median)} · n={count}"
+              if low is not None and high is not None:
+                  if price <= low:
+                      return f"🟢 THẤP HƠN KHUNG THƯỜNG · {money(low)}–{money(high)}"
+                  if price > high:
+                      return f"🔴 CAO HƠN KHUNG THƯỜNG {money(price - high)} · {money(low)}–{money(high)}"
+                  return f"🟡 TRONG KHUNG THƯỜNG · {money(low)}–{money(high)} · lịch sử chưa đủ"
+              if offer["market_level"] in ("low", "typical", "high"):
+                  level = {"low": "thấp", "typical": "bình thường", "high": "cao"}[offer["market_level"]]
+                  return f"⚪ Google đánh giá mức {level}; chưa đủ mốc để kết luận."
+              return "⚪ Chưa đủ dữ liệu thị trường để kết luận rẻ hay cao."
+
           lines = [
-              "✈️ VÉ RẺ BANGKOK",
-              f"Tra lúc: {checked_at}",
-              f"Ngày bay: {dates[0].strftime('%d/%m')}–{dates[-1].strftime('%d/%m/%Y')}",
-              "Một chiều · 1 người lớn · đã so BKK và DMK.",
-              "Mỗi dòng là một vé riêng; SGN và CXR là hai lựa chọn đi.",
-              "Hành lý ký gửi và phí bổ sung chưa xác minh.",
+              f"✈️ VÉ BANGKOK · {dates[0].strftime('%d/%m')}–{dates[-1].strftime('%d/%m/%Y')}",
+              f"Tra lúc {checked_at} · một chiều · 1 người lớn · giá/người",
+              f"Có giá: {len(found)}/6 tổ hợp · xếp từ thấp đến cao",
+              "Mốc: Google Flights, thấp nhất chặng Bangkok (BKK+DMK gộp) theo ngày/điểm đi; không phải giá Skyscanner.",
+              "Hành lý ký gửi/phụ phí chưa xác minh; cần kiểm tra lại khi mở hãng/đại lý.",
               "",
-              "XẾP TỪ GIÁ THẤP NHẤT:",
           ]
-          for offer in sorted(found, key=lambda item: (item["price"], item["date"], item["origin"])):
-              lines.append(
-                  f"• {offer['date'].strftime('%d/%m')} | {offer['origin']} → {offer['airport']} | "
-                  f"{offer['price']:,}đ | {offer['airline']} | {offer['depart']}–{offer['arrive']} | "
-                  f"{offer['stops']} điểm dừng"
-              )
+          for index, offer in enumerate(sorted(found, key=lambda item: (item["price"], item["date"], item["origin"]))):
+              badge = "⭐ RẺ NHẤT TRONG KHUNG DÒ" if index == 0 else "🎫 VÉ RIÊNG"
+              flight = "Bay thẳng" if offer["stops"] == 0 else f"{offer['stops']} điểm dừng"
+              lines.extend([
+                  f"{badge} · {offer['date'].strftime('%d/%m')} · {offer['origin']} → {offer['airport']}",
+                  f"{money(offer['price'])}/người · {offer['airline']} · {flight} · {hhmm(offer['depart'])}–{hhmm(offer['arrive'])}",
+                  market_verdict(offer),
+                  "",
+              ])
           for (origin, day), offer, error in results:
               if not offer and error:
-                  lines.append(f"• {origin} {day.strftime('%d/%m')}: {error}")
+                  lines.append(f"⚠️ {day.strftime('%d/%m')} · {origin}: {error}")
 
           message = "\n".join(lines)
 
