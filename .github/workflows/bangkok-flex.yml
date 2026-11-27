@@ -1,80 +1,163 @@
-name: Bangkok flexible dates
+name: Bangkok cheapest tickets
 on:
-  push:
-    paths: ['.github/workflows/bangkok-flex.yml']
   workflow_dispatch:
+    inputs:
+      center_date:
+        description: "Departure date to check (searches this date ±1 day)"
+        required: true
+        default: "2027-02-08"
+        type: string
 permissions: {}
+concurrency:
+  group: bangkok-cheapest-fares
+  cancel-in-progress: false
 jobs:
   fares:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 5
     steps:
-      - name: Compare exact flight quotes around February 8
+      - name: Search and send the cheapest tickets
         env:
-          KEY: ${{ secrets.SERPAPI_API_KEY }}
+          SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_THREAD_ID: ${{ secrets.TELEGRAM_THREAD_ID }}
+          CENTER_DATE: ${{ inputs.center_date }}
         run: |
           python3 - <<'PY'
           import concurrent.futures
+          import datetime
           import json
           import os
-          import urllib.error
           import urllib.parse
           import urllib.request
 
-          key = os.environ["KEY"].strip()
-          if not key:
-              raise SystemExit("Missing SerpApi key.")
-          origins = ("SGN", "CXR")
-          airports = ("BKK", "DMK")
-          days = [f"2027-02-{day:02d}" for day in range(5, 12)]
+          secret_names = ("SERPAPI_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "TELEGRAM_THREAD_ID")
+          secrets = {name: os.environ.get(name, "").strip() for name in secret_names}
+          missing = [name for name, value in secrets.items() if not value]
+          if missing:
+              raise SystemExit("Missing GitHub secrets: " + ", ".join(missing))
 
-          def quote(task):
-              origin, date = task
-              params = dict(engine="google_flights", departure_id=origin, arrival_id="BKK,DMK",
-                            outbound_date=date, type=2, currency="VND", hl="en", gl="vn", adults=1, api_key=key)
+          try:
+              center = datetime.date.fromisoformat(os.environ["CENTER_DATE"].strip())
+          except ValueError:
+              raise SystemExit("Date must use YYYY-MM-DD.")
+
+          dates = [center + datetime.timedelta(days=offset) for offset in (-1, 0, 1)]
+          origins = ("SGN", "CXR")
+          valid_airports = {"BKK", "DMK"}
+
+          def search(task):
+              origin, day = task
+              params = {
+                  "engine": "google_flights",
+                  "departure_id": origin,
+                  "arrival_id": "BKK,DMK",
+                  "outbound_date": day.isoformat(),
+                  "type": "2",
+                  "currency": "VND",
+                  "hl": "en",
+                  "gl": "vn",
+                  "adults": "1",
+                  "api_key": secrets["SERPAPI_API_KEY"],
+              }
+              url = "https://serpapi.com/search.json?" + urllib.parse.urlencode(params)
               try:
-                  url = "https://serpapi.com/search.json?" + urllib.parse.urlencode(params)
-                  with urllib.request.urlopen(url, timeout=30) as response:
+                  with urllib.request.urlopen(url, timeout=35) as response:
                       data = json.load(response)
-              except urllib.error.HTTPError as error:
-                  return {}, f"HTTP {error.code}"
-              except (ValueError, OSError):
-                  return {}, "request failed"
+              except Exception:
+                  return task, None, "Tra giá thất bại."
               if data.get("error"):
-                  return {}, "provider returned no usable result"
-              by_airport = {}
+                  return task, None, "Nhà cung cấp trả lỗi."
+
+              offers = []
               for group in ("best_flights", "other_flights"):
-                  for offer in data.get(group) or []:
-                      legs = offer.get("flights") or []
-                      price = offer.get("price")
-                      if not legs or type(price) is not int or price <= 0:
+                  for result in data.get(group) or []:
+                      legs = result.get("flights") or []
+                      price = result.get("price")
+                      if not legs or not isinstance(price, (int, float)) or price <= 0:
                           continue
                       arrival = legs[-1].get("arrival_airport") or {}
                       airport = arrival.get("id")
-                      when = arrival.get("time") or ""
-                      if airport not in airports:
+                      if airport not in valid_airports:
                           continue
-                      entry = (price, len(legs) - 1, when, legs[0].get("airline") or "")
-                      if airport not in by_airport or entry < by_airport[airport]:
-                          by_airport[airport] = entry
-              return by_airport, None
+                      departure = legs[0].get("departure_airport") or {}
+                      offers.append({
+                          "date": day,
+                          "origin": origin,
+                          "price": int(price),
+                          "airport": airport,
+                          "airline": legs[0].get("airline") or "Chưa rõ hãng",
+                          "depart": departure.get("time") or "Chưa rõ giờ",
+                          "arrive": arrival.get("time") or "Chưa rõ giờ",
+                          "stops": len(legs) - 1,
+                      })
+              return task, (min(offers, key=lambda item: (item["price"], item["stops"])) if offers else None), None
 
-          tasks = [(origin, date) for date in days for origin in origins]
+          tasks = [(origin, day) for day in dates for origin in origins]
           with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-              results = dict(zip(tasks, pool.map(quote, tasks)))
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as out:
-              print("Exact fare offers, VND / adult / one way. Any stops. Baggage fees unverified.", file=out)
-              print("", file=out)
-              for date in days:
-                  for airport in airports:
-                      offers = [results[origin, date][0].get(airport) for origin in origins]
-                      parts = [f"{origin} {offer[0]:,} VND ({offer[1]} stops; {offer[2]}; {offer[3]})"
-                               if offer else f"{origin} —" for origin, offer in zip(origins, offers)]
-                      total = f"{sum(offer[0] for offer in offers):,} VND" if all(offers) else "—"
-                      print(f"- {date[8:]} Feb {airport} | " + " | ".join(parts) + f" | Total {total}", file=out)
-              for (origin, date), (_, error) in results.items():
-                  if error:
-                      print(f"- {origin} {date}: {error}", file=out)
-          if not any(fares for fares, _ in results.values()):
-              raise SystemExit("No priced offers returned.")
+              results = list(pool.map(search, tasks))
+
+          found = [offer for _, offer, _ in results if offer]
+          if not found:
+              raise SystemExit("Không tìm thấy vé có giá; chưa gửi Telegram.")
+
+          checked_at = datetime.datetime.now(
+              datetime.timezone(datetime.timedelta(hours=7))
+          ).strftime("%H:%M %d/%m/%Y (giờ Việt Nam)")
+          lines = [
+              "✈️ VÉ RẺ BANGKOK",
+              f"Tra lúc: {checked_at}",
+              f"Ngày bay: {dates[0].strftime('%d/%m')}–{dates[-1].strftime('%d/%m/%Y')}",
+              "Một chiều · 1 người lớn · đã so BKK và DMK.",
+              "Mỗi dòng là một vé riêng; SGN và CXR là hai lựa chọn đi.",
+              "Hành lý ký gửi và phí bổ sung chưa xác minh.",
+              "",
+              "XẾP TỪ GIÁ THẤP NHẤT:",
+          ]
+          for offer in sorted(found, key=lambda item: (item["price"], item["date"], item["origin"])):
+              lines.append(
+                  f"• {offer['date'].strftime('%d/%m')} | {offer['origin']} → {offer['airport']} | "
+                  f"{offer['price']:,}đ | {offer['airline']} | {offer['depart']}–{offer['arrive']} | "
+                  f"{offer['stops']} điểm dừng"
+              )
+          for (origin, day), offer, error in results:
+              if not offer and error:
+                  lines.append(f"• {origin} {day.strftime('%d/%m')}: {error}")
+
+          message = "\n".join(lines)
+
+          def telegram(method, payload=None):
+              body = urllib.parse.urlencode(payload or {}).encode()
+              request = urllib.request.Request(
+                  f"https://api.telegram.org/bot{secrets['TELEGRAM_BOT_TOKEN']}/{method}",
+                  data=body,
+                  headers={"Content-Type": "application/x-www-form-urlencoded"},
+              )
+              with urllib.request.urlopen(request, timeout=25) as response:
+                  return json.load(response)
+
+          identity = telegram("getMe")
+          if not identity.get("ok") or identity.get("result", {}).get("username") != "MM_suggest_travel_bot":
+              raise SystemExit("Sai bot Telegram; báo cáo chưa gửi.")
+
+          sent = telegram("sendMessage", {
+              "chat_id": secrets["TELEGRAM_CHAT_ID"],
+              "message_thread_id": secrets["TELEGRAM_THREAD_ID"],
+              "text": message,
+              "disable_web_page_preview": "true",
+          })
+          if not sent.get("ok"):
+              raise SystemExit("Telegram từ chối báo cáo.")
+
+          delivered = sent.get("result", {})
+          if (
+              str(delivered.get("chat", {}).get("id")) != secrets["TELEGRAM_CHAT_ID"]
+              or str(delivered.get("message_thread_id", "")) != secrets["TELEGRAM_THREAD_ID"]
+          ):
+              raise SystemExit("Telegram trả về sai nhóm hoặc topic.")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("Telegram đã nhận báo cáo và topic đã được xác minh.\n\n")
+              summary.write(message.replace("\n", "  \n"))
           PY
