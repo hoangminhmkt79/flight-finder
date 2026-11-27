@@ -7,6 +7,10 @@ on:
         required: true
         default: "2027-02-08"
         type: string
+      trip_plan:
+        description: "Bắc Thái 08–15/02/2027: so tổng chi phí, 6 lượt tra giá"
+        type: boolean
+        default: false
 permissions: {}
 concurrency:
   group: bangkok-cheapest-fares
@@ -22,6 +26,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_THREAD_ID: ${{ vars.TELEGRAM_THREAD_ID }}
+          TRIP_PLAN: ${{ inputs.trip_plan }}
           CENTER_DATE: ${{ inputs.center_date }}
         run: |
           python3 - <<'PY'
@@ -49,14 +54,14 @@ jobs:
 
           dates = [center + datetime.timedelta(days=offset) for offset in (-1, 0, 1)]
           origins = ("SGN", "CXR")
-          valid_airports = {"BKK", "DMK"}
 
-          def search(task):
+          def search(task, destination="BKK,DMK"):
+              allowed_arrivals = set(destination.split(","))
               origin, day = task
               params = {
                   "engine": "google_flights",
                   "departure_id": origin,
-                  "arrival_id": "BKK,DMK",
+                  "arrival_id": destination,
                   "outbound_date": day.isoformat(),
                   "type": "2",
                   "currency": "VND",
@@ -100,7 +105,7 @@ jobs:
                           continue
                       arrival = legs[-1].get("arrival_airport") or {}
                       airport = arrival.get("id")
-                      if airport not in valid_airports:
+                      if airport not in allowed_arrivals:
                           continue
                       departure = legs[0].get("departure_airport") or {}
                       offers.append({
@@ -108,6 +113,7 @@ jobs:
                           "origin": origin,
                           "price": int(price),
                           "airport": airport,
+                          "departure_airport": departure.get("id") or origin,
                           "airline": legs[0].get("airline") or "Chưa rõ hãng",
                           "depart": departure.get("time") or "Chưa rõ giờ",
                           "arrive": arrival.get("time") or "Chưa rõ giờ",
@@ -118,17 +124,11 @@ jobs:
                           "history_count": len(history_prices),
                           "market_level": market_level,
                       })
+              if os.environ.get("TRIP_PLAN") == "true":
+                  offers = [offer for offer in offers if offer["stops"] == 0]
               if not offers:
                   return task, None, "Không có chuyến có giá."
               return task, min(offers, key=lambda item: (item["price"], item["stops"])), None
-
-          tasks = [(origin, day) for day in dates for origin in origins]
-          with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-              results = list(pool.map(search, tasks))
-
-          found = [offer for _, offer, _ in results if offer]
-          if not found:
-              raise SystemExit("Không tìm thấy vé có giá; chưa gửi Telegram.")
 
           checked_at = datetime.datetime.now(
               datetime.timezone(datetime.timedelta(hours=7))
@@ -143,45 +143,125 @@ jobs:
               except (TypeError, ValueError):
                   return value[-5:] if isinstance(value, str) and len(value) >= 5 else "chưa rõ giờ"
 
-          def market_verdict(offer):
-              price = offer["price"]
-              median, count = offer["history_median"], offer["history_count"]
-              if median is not None:
-                  delta = price - median
-                  pct = round(delta / median * 100) if median else 0
-                  threshold = max(250_000, int(median * 0.10))
-                  if delta <= -threshold:
-                      return f"🟢 RẺ RÕ · thấp hơn median 30 ngày {money(abs(delta))} ({abs(pct)}%) · n={count}"
-                  if delta >= threshold:
-                      return f"🔴 CAO HƠN MỐC 30 NGÀY {money(delta)} ({pct:+d}%) · cân nhắc đổi ngày · n={count}"
-                  side = "thấp hơn" if delta < 0 else "cao hơn" if delta > 0 else "bằng"
-                  return f"🟡 GẦN MẶT BẰNG · {side} median {money(abs(delta))} ({pct:+d}%) · n={count}"
-              if offer["market_level"] in ("low", "typical", "high"):
-                  level = {"low": "thấp", "typical": "bình thường", "high": "cao"}[offer["market_level"]]
-                  return f"⚪ Google báo mức {level}, nhưng thiếu lịch sử để kết luận."
-              return "⚪ Chưa đủ dữ liệu lịch sử để kết luận rẻ hay cao.";
-          lines = [
-              f"✈️ VÉ BANGKOK · {dates[0].strftime('%d/%m')}–{dates[-1].strftime('%d/%m/%Y')}",
-              f"Tra lúc {checked_at} · một chiều · 1 người lớn · giá/người",
-              f"Có giá: {len(found)}/6 tổ hợp · xếp từ thấp đến cao",
-              "Mốc: Google Flights, thấp nhất chặng Bangkok (BKK+DMK gộp) theo ngày/điểm đi; không phải giá Skyscanner.",
-              "Hành lý ký gửi/phụ phí chưa xác minh; cần kiểm tra lại khi mở hãng/đại lý.",
-              "",
-          ]
-          for index, offer in enumerate(sorted(found, key=lambda item: (item["price"], item["date"], item["origin"]))):
-              badge = "⭐ RẺ NHẤT TRONG KHUNG DÒ" if index == 0 else "🎫 VÉ RIÊNG"
-              flight = "Bay thẳng" if offer["stops"] == 0 else f"{offer['stops']} điểm dừng"
-              lines.extend([
-                  f"{badge} · {offer['date'].strftime('%d/%m')} · {offer['origin']} → {offer['airport']}",
-                  f"{money(offer['price'])}/người · {offer['airline']} · {flight} · {hhmm(offer['depart'])}–{hhmm(offer['arrive'])}",
-                  market_verdict(offer),
-                  "",
-              ])
-          for (origin, day), offer, error in results:
-              if not offer and error:
-                  lines.append(f"⚠️ {day.strftime('%d/%m')} · {origin}: {error}")
+          def trip_report():
+              feb = datetime.date(2027, 2, 1)
+              route_specs = [
+                  ("CXR", 8, "BKK,DMK"), ("SGN", 8, "BKK,DMK"),
+                  ("CXR", 9, "BKK"), ("SGN", 9, "BKK"),
+                  ("BKK,DMK", 10, "CNX"), ("CNX", 15, "SGN"),
+              ]
+              with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                  pending = [
+                      pool.submit(search, (origin, feb.replace(day=day)), destination)
+                      for origin, day, destination in route_specs
+                  ]
+                  offers = [future.result()[1] for future in pending]
 
-          message = "\n".join(lines)
+              lines = [
+                  "✈️ BẮC THÁI · 08–15/02/2027 · 2 người",
+                  f"Tra lúc {checked_at} · Google Flights qua SerpApi",
+                  "08/02: Bangkok 2 đêm · có trọn 09/02 tham quan.",
+                  "09/02: Bangkok 1 đêm · cả hai cùng đáp BKK.",
+                  "10–11 Chiang Mai · 12–13 Pai · 14 về Chiang Mai · 15 về SGN.",
+                  "Google Flights trả giá tìm cho 1 khách. Nhân 2 với chặng bay chung để dự toán.",
+                  "",
+              ]
+              for (origin, day, destination), offer in zip(route_specs, offers):
+                  if offer is None:
+                      lines.append(f"{day:02d}/02 {origin} → {destination}: chưa có giá bay thẳng.")
+                      continue
+                  lines.append(
+                      f"{day:02d}/02 {offer['departure_airport']} → {offer['airport']} · {hhmm(offer['depart'])}–"
+                      f"{hhmm(offer['arrive'])} · {offer['airline']} · {money(offer['price'])}/người"
+                  )
+
+              def sum_fares(indices):
+                  subset = [offers[index] for index in indices]
+                  if any(offer is None for offer in subset):
+                      return None
+                  return sum(offer["price"] for offer in subset)
+
+              outbound_8 = sum_fares((0, 1))
+              outbound_9 = sum_fares((2, 3))
+              shared_one = sum_fares((4, 5))
+              lines.append("")
+              for day, outbound in ((8, outbound_8), (9, outbound_9)):
+                  if outbound is None or shared_one is None:
+                      lines.append(f"{day:02d}/02: thiếu giá nên chưa tính tổng trip.")
+                      continue
+                  flights = outbound + 2 * shared_one
+                  ground_baht = (13_150, 22_740) if day == 8 else (12_150, 20_940)
+                  ground = tuple(baht * 770 for baht in ground_baht)
+                  lines.append(
+                      f"{day:02d}/02 · Vé {money(flights)} · "
+                      f"Tổng dự toán {money(flights + ground[0])}–{money(flights + ground[1])}"
+                  )
+              if outbound_8 is not None and outbound_9 is not None:
+                  difference = outbound_9 - outbound_8
+                  if difference > 0:
+                      lines.append(
+                          f"09/02 đắt hơn {money(difference)} tiền vé vào Bangkok. "
+                          "Nếu tiết kiệm khách sạn, ăn uống và di chuyển hơn khoản đó, đi 09/02 rẻ hơn tổng thể."
+                      )
+                  else:
+                      lines.append("09/02 có tiền vé vào Bangkok bằng hoặc thấp hơn và bớt một đêm lưu trú.")
+              lines.extend([
+                  "Chi phí mặt đất (THB/2 người): phòng 5.550–9.900 (08/02) hoặc 4.550–8.100 (09/02); ăn 4.000–6.600; xe nội đô 1.800–3.300; tham quan 1.200–1.500; van Pai 600–1.440.",
+                  "Quy đổi dự toán 770đ/THB. Chưa gồm ký gửi, bảo hiểm và mua sắm.",
+                  "Giá và giờ là kết quả từng chuyến tra được. Cần kiểm tra còn hai ghế, hành lý và sân bay trước khi mua.",
+              ])
+              return "\n".join(lines)
+
+          if os.environ.get("TRIP_PLAN") == "true":
+              message = trip_report()
+          else:
+              tasks = [(origin, day) for day in dates for origin in origins]
+              with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                  results = list(pool.map(search, tasks))
+
+              found = [offer for _, offer, _ in results if offer]
+              if not found:
+                  raise SystemExit("Không tìm thấy vé có giá; chưa gửi Telegram.")
+
+              def market_verdict(offer):
+                  price = offer["price"]
+                  median, count = offer["history_median"], offer["history_count"]
+                  if median is not None:
+                      delta = price - median
+                      pct = round(delta / median * 100) if median else 0
+                      threshold = max(250_000, int(median * 0.10))
+                      if delta <= -threshold:
+                          return f"🟢 RẺ RÕ · thấp hơn median 30 ngày {money(abs(delta))} ({abs(pct)}%) · n={count}"
+                      if delta >= threshold:
+                          return f"🔴 CAO HƠN MỐC 30 NGÀY {money(delta)} ({pct:+d}%) · cân nhắc đổi ngày · n={count}"
+                      side = "thấp hơn" if delta < 0 else "cao hơn" if delta > 0 else "bằng"
+                      return f"🟡 GẦN MẶT BẰNG · {side} median {money(abs(delta))} ({pct:+d}%) · n={count}"
+                  if offer["market_level"] in ("low", "typical", "high"):
+                      level = {"low": "thấp", "typical": "bình thường", "high": "cao"}[offer["market_level"]]
+                      return f"⚪ Google báo mức {level}, nhưng thiếu lịch sử để kết luận."
+                  return "⚪ Chưa đủ dữ liệu lịch sử để kết luận rẻ hay cao.";
+              lines = [
+                  f"✈️ VÉ BANGKOK · {dates[0].strftime('%d/%m')}–{dates[-1].strftime('%d/%m/%Y')}",
+                  f"Tra lúc {checked_at} · một chiều · 1 người lớn · giá/người",
+                  f"Có giá: {len(found)}/6 tổ hợp · xếp từ thấp đến cao",
+                  "Mốc: Google Flights, thấp nhất chặng Bangkok (BKK+DMK gộp) theo ngày/điểm đi; không phải giá Skyscanner.",
+                  "Hành lý ký gửi/phụ phí chưa xác minh; cần kiểm tra lại khi mở hãng/đại lý.",
+                  "",
+              ]
+              for index, offer in enumerate(sorted(found, key=lambda item: (item["price"], item["date"], item["origin"]))):
+                  badge = "⭐ RẺ NHẤT TRONG KHUNG DÒ" if index == 0 else "🎫 VÉ RIÊNG"
+                  flight = "Bay thẳng" if offer["stops"] == 0 else f"{offer['stops']} điểm dừng"
+                  lines.extend([
+                      f"{badge} · {offer['date'].strftime('%d/%m')} · {offer['origin']} → {offer['airport']}",
+                      f"{money(offer['price'])}/người · {offer['airline']} · {flight} · {hhmm(offer['depart'])}–{hhmm(offer['arrive'])}",
+                      market_verdict(offer),
+                      "",
+                  ])
+              for (origin, day), offer, error in results:
+                  if not offer and error:
+                      lines.append(f"⚠️ {day.strftime('%d/%m')} · {origin}: {error}")
+
+              message = "\n".join(lines)
 
           def telegram(method, payload=None):
               body = urllib.parse.urlencode(payload or {}).encode()
